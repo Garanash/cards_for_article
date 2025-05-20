@@ -9,6 +9,7 @@ from io import BytesIO
 import time
 import requests
 from openai import OpenAI
+from bs4 import BeautifulSoup
 from urllib.parse import quote
 
 # Настройки
@@ -18,7 +19,8 @@ FONT_PATH = 'arial.ttf'  # Путь к шрифту (можно заменить
 PERPLEXITY_API_KEY = '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'  # Ваш API ключ Perplexity
 PEXELS_API_KEY = 'LL7VOO8r9vmajcOiFTrnxUucqZO7XxC7mStcsjNCniBNaLGedWBpbPeI'  # API ключ для поиска изображений
 DELAY = 2  # Задержка между запросами (секунды)
-PLACEHOLDER_IMAGE = 'placeholder.jpg'
+PLACEHOLDER_IMAGE = 'placeholder.png'
+YANDEX_SEARCH_URL = "https://yandex.eu/images/search"  # Европейский домен
 
 # Создаем папки
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -28,11 +30,11 @@ os.makedirs('temp_images', exist_ok=True)
 # Цветовая схема
 COLORS = {
     'background': (255, 255, 255),
-    'header': (13, 71, 161),  # Темно-синий
-    'footer': (13, 71, 161),  # Темно-синий
-    'accent': (255, 87, 34),  # Оранжевый
-    'text': (33, 33, 33),  # Темно-серый
-    'light_text': (250, 250, 250)  # Белый для текста в хедере/футере
+    'header': (13, 71, 161),
+    'footer': (13, 71, 161),
+    'accent': (255, 87, 34),
+    'text': (33, 33, 33),
+    'light_text': (250, 250, 250)
 }
 
 
@@ -40,13 +42,13 @@ def create_placeholder_image():
     """Создает изображение-заглушку если его нет"""
     if not os.path.exists(PLACEHOLDER_IMAGE):
         try:
-            img = Image.new('RGB', (400, 300), (245, 245, 245))
+            img = Image.new('RGB', (350, 250), (245, 245, 245))
             draw = ImageDraw.Draw(img)
-            font = ImageFont.truetype("fonts/NotoSans-Bold.ttf", 24)
+            font = ImageFont.truetype("fonts/NotoSans-Bold.ttf", 20)
             text = "Изображение отсутствует"
             text_width = draw.textlength(text, font=font)
             draw.text(
-                ((400 - text_width) // 2, 140),
+                ((350 - text_width) // 2, 115),
                 text,
                 fill=(200, 200, 200),
                 font=font
@@ -112,89 +114,82 @@ def sanitize_filename(filename):
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
 
-def search_product_image(article):
-    """Улучшенный поиск изображения через Perplexity API"""
+def search_yandex_images(query, result_position=5):
+    """Поиск изображений через европейский домен Яндекса (6-е по популярности)"""
     try:
-        response = client.chat.completions.create(
-            model="sonar-pro",  # Исправленная модель
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ты помощник, который находит только URL изображений товаров или технических чертежей без авторских прав. Отвечай только URL без комментариев."
-                },
-                {
-                    "role": "user",
-                    "content": f"Найди точный URL изображения или технического чертежа детали с артикулом {article}. Изображение должно быть свободно от авторских прав. Ответ должен содержать только URL изображения в формате JPG или PNG."
-                }
-            ],
-            temperature=0.1  # Для более точных результатов
-        )
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+        }
+        params = {
+            'text': query,
+            'nomisspell': 1,
+            'noreask': 1,
+            'isize': 'medium',  # Средний размер изображений
+            'itype': 'jpg'  # Предпочтительный формат
+        }
 
-        # Извлекаем URL из ответа
-        response_text = response.choices[0].message.content
-        url_match = re.search(r'https?://[^\s]+\.(?:jpg|jpeg|png)', response_text)
+        response = requests.get(YANDEX_SEARCH_URL, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
 
-        if url_match:
-            image_url = url_match.group(0)
-            try:
-                response = requests.get(image_url, timeout=10)
-                response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        images = soup.find_all('img', class_='serp-item__thumb')
 
-                temp_path = f"temp_images/{article}_temp.jpg"
+        if len(images) > result_position:
+            img_url = images[result_position].get('src')
+            if img_url and img_url.startswith('//'):
+                img_url = 'https:' + img_url
+
+            if img_url:
+                img_response = requests.get(img_url, headers=headers, timeout=15)
+                img_response.raise_for_status()
+
+                temp_path = f"temp_images/{query}_temp.jpg"
                 with open(temp_path, 'wb') as f:
-                    f.write(response.content)
+                    f.write(img_response.content)
 
                 img = Image.open(temp_path)
-                # Конвертируем в RGB если нужно
                 if img.mode in ('RGBA', 'P'):
                     img = img.convert('RGB')
                 return img
 
-            except Exception as e:
-                print(f"Ошибка загрузки изображения: {str(e)}")
-
         return Image.open(PLACEHOLDER_IMAGE) if os.path.exists(PLACEHOLDER_IMAGE) else None
 
     except Exception as e:
-        print(f"Ошибка поиска изображения: {str(e)}")
+        print(f"Ошибка поиска изображения в Яндекс: {str(e)}")
         return Image.open(PLACEHOLDER_IMAGE) if os.path.exists(PLACEHOLDER_IMAGE) else None
 
 
 def perplexity_search(article):
-    """Получение информации о товаре"""
+    """Получение информации о товаре в формате списка характеристик"""
     try:
         response = client.chat.completions.create(
             model="sonar-pro",
             messages=[
                 {
                     "role": "system",
-                    "content": "Ты помощник, который предоставляет только технические характеристики товаров. Удаляй все сноски, квадратные скобки и коммерческую информацию."
+                    "content": "Ты помощник, который предоставляет технические характеристики товаров в формате: 'Параметр: значение'. Удаляй все сноски, символы (#, *, []) и коммерческую информацию."
                 },
                 {
                     "role": "user",
-                    "content": f"Дай полное описание и технические характеристики товара с артикулом {article}. Только факты, без цен, предложений купить и сносок. Форматируй как маркированный список, удаляя все квадратные скобки."
+                    "content": f"Дай технические характеристики товара с артикулом {article} в строгом формате 'Параметр: значение'. Только факты, без цен, предложений купить и комментариев. Пример:\nМатериал: сталь\nВес: 1.5 кг\nЦвет: серебристый"
                 }
             ],
-            temperature=0.3  # Для более точных результатов
+            temperature=0.2  # Минимум креативности для точности
         )
-        return response.choices[0].message.content
+
+        # Очистка и форматирование текста
+        text = response.choices[0].message.content
+        lines = []
+        for line in text.split('\n'):
+            line = re.sub(r'[#*\[\]]', '', line.strip())  # Удаляем спецсимволы
+            if line and ':' in line and not any(word in line.lower() for word in ['цена', 'стоимость', 'руб']):
+                lines.append(line)
+
+        return '\n'.join(lines)
     except Exception as e:
         print(f"Ошибка запроса к Perplexity: {e}")
         return None
-
-
-def clean_text(text):
-    """Очистка текста от сносок и лишних символов"""
-    if not text:
-        return ""
-
-    # Удаляем квадратные скобки с цифрами
-    text = re.sub(r'\[\d+\]', '', text)
-    # Удаляем упоминания цены
-    text = re.sub(r'цена|стоимость|руб|₽|р\.|купить|заказать', '', text, flags=re.IGNORECASE)
-    # Удаляем лишние пробелы и переносы
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
 
 
 def extract_product_info(article):
@@ -203,21 +198,19 @@ def extract_product_info(article):
     if not search_results:
         return None
 
-    # Очистка текста
-    cleaned_details = []
+    # Разбиваем на список характеристик
+    characteristics = []
     for line in search_results.split('\n'):
-        line = clean_text(line)
-        if line:
-            # Заменяем маркеры на единый стиль
-            line = re.sub(r'^[\s•\-*]+', '• ', line)
-            cleaned_details.append(line)
+        if ':' in line:
+            param, value = line.split(':', 1)
+            characteristics.append(f"{param.strip()}: {value.strip()}")
 
-    # Поиск изображения
-    image_data = search_product_image(article)
+    # Поиск изображения через Яндекс (6-е по популярности)
+    image_data = search_yandex_images(article, 5)
 
     return {
         'name': article,
-        'details': cleaned_details,
+        'characteristics': characteristics,
         'image': image_data
     }
 
@@ -232,8 +225,8 @@ def create_product_card(article, product_info):
 
         # Загружаем шрифты
         title_font = load_font('bold', 32)
-        text_font = load_font('regular', 22)
-        bullet_font = load_font('bold', 22)
+        subtitle_font = load_font('bold', 24)
+        text_font = load_font('regular', 20)
 
         # Верхний колонтитул
         header_height = 60
@@ -248,16 +241,15 @@ def create_product_card(article, product_info):
 
         # Основное содержимое
         content_start = header_height + 40
-        content_width = card_width - 80
         y_pos = content_start
 
-        # Изображение товара (меньшего размера)
+        # Изображение товара (уменьшенный размер)
         img = product_info['image'] or Image.open(PLACEHOLDER_IMAGE) if os.path.exists(PLACEHOLDER_IMAGE) else None
 
         if img:
             # Максимальные размеры для изображения
-            max_img_width = 400
-            max_img_height = 300
+            max_img_width = 350
+            max_img_height = 250
 
             # Масштабируем с сохранением пропорций
             img_ratio = img.width / img.height
@@ -276,9 +268,6 @@ def create_product_card(article, product_info):
 
             # Добавляем белую рамку
             bordered_img = ImageOps.expand(img, border=1, fill='white')
-            # Добавляем тень
-            shadow = Image.new('RGBA', (new_width + 6, new_height + 6), (0, 0, 0, 30))
-            card.paste(shadow, (img_x + 3, img_y + 3), shadow)
             # Вставляем изображение
             card.paste(bordered_img, (img_x, img_y))
 
@@ -295,7 +284,7 @@ def create_product_card(article, product_info):
             (text_x, y_pos),
             f"Артикул: {article}",
             fill=COLORS['text'],
-            font=title_font
+            font=subtitle_font
         )
         y_pos += 50
 
@@ -303,46 +292,38 @@ def create_product_card(article, product_info):
         draw.line([(text_x, y_pos), (text_x + text_width, y_pos)], fill=COLORS['header'], width=2)
         y_pos += 30
 
-        # Характеристики с маркерами
-        bullet = "•"
-        bullet_width = draw.textlength(bullet, font=bullet_font)
-        max_line_width = text_width - bullet_width - 10
+        # Заголовок характеристик
+        draw.text(
+            (text_x, y_pos),
+            "ХАРАКТЕРИСТИКИ:",
+            fill=COLORS['accent'],
+            font=subtitle_font
+        )
+        y_pos += 40
 
-        for line in product_info['details']:
-            if line.strip():
-                # Разбиваем длинные строки
-                words = line.split()
-                current_line = []
+        # Вывод характеристик в формате "Параметр: значение"
+        for char in product_info['characteristics']:
+            if ':' in char:
+                param, value = char.split(':', 1)
+                # Параметр (жирный)
+                draw.text(
+                    (text_x, y_pos),
+                    f"{param.strip()}:",
+                    fill=COLORS['text'],
+                    font=load_font('bold', 20)
+                )
+                param_width = draw.textlength(f"{param.strip()}:", font=load_font('bold', 20))
+                # Значение (обычный)
+                draw.text(
+                    (text_x + param_width + 10, y_pos),
+                    value.strip(),
+                    fill=COLORS['text'],
+                    font=text_font
+                )
+                y_pos += 30
 
-                # Первая строка с маркером
-                draw.text((text_x, y_pos), bullet, fill=COLORS['accent'], font=bullet_font)
-
-                for word in words:
-                    test_line = ' '.join(current_line + [word])
-                    if draw.textlength(test_line, font=text_font) <= max_line_width:
-                        current_line.append(word)
-                    else:
-                        if current_line:
-                            draw.text(
-                                (text_x + bullet_width + 10, y_pos),
-                                ' '.join(current_line),
-                                fill=COLORS['text'],
-                                font=text_font
-                            )
-                            y_pos += 30
-                        current_line = [word]
-
-                if current_line:
-                    draw.text(
-                        (text_x + bullet_width + 10, y_pos),
-                        ' '.join(current_line),
-                        fill=COLORS['text'],
-                        font=text_font
-                    )
-                    y_pos += 30
-
-                if y_pos > card_height - 100:
-                    break
+            if y_pos > card_height - 100:
+                break
 
         # Нижний колонтитул
         footer_height = 40
@@ -396,6 +377,6 @@ def process_articles(file_path):
 
 if __name__ == '__main__':
     print("=== Генератор технических карточек товаров ===")
-    print("Альбомная ориентация с улучшенным дизайном")
+    print("Поиск изображений через Yandex.eu | Четкий список характеристик")
     process_articles(INPUT_FILE)
     print("\n=== Обработка завершена ===")
