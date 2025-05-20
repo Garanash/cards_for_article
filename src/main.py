@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import base64
 import os
 import re
+import sys
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from io import BytesIO
@@ -16,195 +18,313 @@ FONT_PATH = 'arial.ttf'  # Путь к шрифту (можно заменить
 PERPLEXITY_API_KEY = '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'  # Ваш API ключ Perplexity
 PEXELS_API_KEY = 'LL7VOO8r9vmajcOiFTrnxUucqZO7XxC7mStcsjNCniBNaLGedWBpbPeI'  # API ключ для поиска изображений
 DELAY = 2  # Задержка между запросами (секунды)
+PLACEHOLDER_IMAGE = 'placeholder.jpg'
 
-# Создаем папку для карточек
+
+# Создаем папки
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+os.makedirs('fonts', exist_ok=True)
+os.makedirs('temp_images', exist_ok=True)
+
+# Цветовая схема
+COLORS = {
+    'background': (255, 255, 255),
+    'primary': (45, 55, 72),  # Темно-синий
+    'secondary': (230, 230, 230),  # Светло-серый
+    'accent': (220, 60, 50),  # Красный
+    'text': (60, 60, 60),  # Темно-серый
+    'light_text': (150, 150, 150)  # Светло-серый
+}
+
+
+def create_placeholder_image():
+    """Создает изображение-заглушку если его нет"""
+    if not os.path.exists(PLACEHOLDER_IMAGE):
+        try:
+            img = Image.new('RGB', (800, 500), (245, 245, 245))
+            draw = ImageDraw.Draw(img)
+            font = ImageFont.truetype("fonts/NotoSans-Bold.ttf", 40)
+            text = "Изображение отсутствует"
+            text_width = draw.textlength(text, font=font)
+            draw.text(
+                ((800 - text_width) // 2, 230),
+                text,
+                fill=(200, 200, 200),
+                font=font
+            )
+            img.save(PLACEHOLDER_IMAGE)
+            print(f"Создано изображение-заглушка: {PLACEHOLDER_IMAGE}")
+        except:
+            print("Не удалось создать заглушку, будет использован белый фон")
+
+
+create_placeholder_image()
+
+
+def download_font(font_url, font_path):
+    """Скачиваем шрифт, если его нет"""
+    if not os.path.exists(font_path):
+        try:
+            response = requests.get(font_url)
+            with open(font_path, 'wb') as f:
+                f.write(response.content)
+            print(f"Шрифт скачан: {font_path}")
+        except Exception as e:
+            print(f"Ошибка загрузки шрифта: {e}")
+            return False
+    return True
+
+
+# Конфигурация шрифтов
+FONT_CONFIG = {
+    'regular': {
+        'url': 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf',
+        'path': 'fonts/NotoSans-Regular.ttf'
+    },
+    'bold': {
+        'url': 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Bold.ttf',
+        'path': 'fonts/NotoSans-Bold.ttf'
+    },
+    'light': {
+        'url': 'https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Light.ttf',
+        'path': 'fonts/NotoSans-Light.ttf'
+    }
+}
+
+# Скачиваем шрифты
+for font_type in FONT_CONFIG.values():
+    if not download_font(font_type['url'], font_type['path']):
+        print("Не удалось загрузить шрифты, попробуйте вручную скачать")
+        sys.exit(1)
+
+
+def load_font(font_type='regular', size=12):
+    """Загрузка шрифта из локальной папки"""
+    try:
+        font_path = FONT_CONFIG[font_type]['path']
+        return ImageFont.truetype(font_path, size, encoding='unic')
+    except Exception as e:
+        print(f"Ошибка загрузки шрифта {font_type}: {e}")
+        return ImageFont.load_default(size)
+
 
 # Инициализация клиента Perplexity
 client = OpenAI(api_key=PERPLEXITY_API_KEY, base_url="https://api.perplexity.ai")
 
 
 def sanitize_filename(filename):
-    """Удаление недопустимых символов из имени файла"""
+    """Создание безопасного имени файла"""
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
 
-def translit_to_ascii(text):
-    """Транслитерация кириллицы в латиницу для поиска изображений"""
-    translit_dict = {
-        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
-        'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k',
-        'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
-        'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
-        'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '',
-        'э': 'e', 'ю': 'yu', 'я': 'ya'
-    }
-
-    result = []
-    for char in text.lower():
-        if char in translit_dict:
-            result.append(translit_dict[char])
-        elif char.isalnum():
-            result.append(char)
-        else:
-            result.append(' ')
-
-    return ' '.join(''.join(result).split())
-
-
-def search_product_image(query):
-    """Безопасный поиск изображения через Pexels API с обработкой Unicode"""
+def search_product_image(article):
+    """Поиск изображения через Perplexity API"""
     try:
-        # Транслитерируем запрос и кодируем для URL
-        clean_query = translit_to_ascii(query)
-        encoded_query = quote(clean_query)
+        response = client.chat.completions.create(
+            model="sonar-large-online",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Ты помощник, который находит только URL изображения товаров. Отвечай только URL изображения без каких-либо комментариев."
+                },
+                {
+                    "role": "user",
+                    "content": f"Найди URL изображения товара с артикулом {article}. Ответ должен содержать только URL изображения в формате JPG или PNG."
+                }
+            ]
+        )
 
-        headers = {"Authorization": PEXELS_API_KEY}
-        url = f"https://api.pexels.com/v1/search?query={encoded_query}&per_page=1"
+        # Извлекаем URL из ответа
+        response_text = response.choices[0].message.content
+        url_match = re.search(r'https?://[^\s]+\.(?:jpg|jpeg|png)', response_text)
 
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
+        if url_match:
+            image_url = url_match.group(0)
+            response = requests.get(image_url)
+            temp_path = f"temp_images/{article}_temp.jpg"
+            with open(temp_path, 'wb') as f:
+                f.write(response.content)
+            return Image.open(temp_path)
 
-        data = response.json()
-        if data.get('photos') and len(data['photos']) > 0:
-            return data['photos'][0]['src']['medium']
-        return None
+        return Image.open(PLACEHOLDER_IMAGE) if os.path.exists(PLACEHOLDER_IMAGE) else None
     except Exception as e:
         print(f"Ошибка поиска изображения: {str(e)}")
-        return None
+        return Image.open(PLACEHOLDER_IMAGE) if os.path.exists(PLACEHOLDER_IMAGE) else None
 
 
-def perplexity_search(query):
-    """Поиск через Perplexity API"""
+def perplexity_search(article):
+    """Получение информации о товаре"""
     try:
         response = client.chat.completions.create(
             model="sonar-pro",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": query}
+                {
+                    "role": "system",
+                    "content": "Ты помощник, который предоставляет только технические характеристики товаров. Удаляй все сноски и квадратные скобки с цифрами из ответа."
+                },
+                {
+                    "role": "user",
+                    "content": f"Дай полное описание и все характеристики товара с артикулом {article}. Только технические характеристики, без цены, коммерческих предложений и сносок. Форматируй ответ как маркированный список, удаляя все квадратные скобки с цифрами."
+                }
             ]
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"Ошибка поиска Perplexity: {e}")
+        print(f"Ошибка запроса к Perplexity: {e}")
         return None
 
 
-def extract_product_info_from_perplexity(article):
-    """Извлечение информации о товаре с помощью Perplexity API"""
-    query = f"Найди полное описание и все характеристики артикула: {article}. Выведи только технические характеристики, без цены и других коммерческих предложений."
-    search_results = perplexity_search(query)
+def clean_text(text):
+    """Очистка текста от сносок и лишних символов"""
+    if not text:
+        return ""
 
+    # Удаляем квадратные скобки с цифрами
+    text = re.sub(r'\[\d+\]', '', text)
+    # Удаляем упоминания цены
+    text = re.sub(r'цена|стоимость|руб|₽|р\.', '', text, flags=re.IGNORECASE)
+    # Удаляем лишние пробелы и переносы
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def extract_product_info(article):
+    """Извлечение информации о товаре"""
+    search_results = perplexity_search(article)
     if not search_results:
         return None
 
-    # Удаляем строки, содержащие слово "Цена" в любом регистре
+    # Очистка текста
     cleaned_details = []
     for line in search_results.split('\n'):
-        if not re.search(r'цена', line, re.IGNORECASE):
+        line = clean_text(line)
+        if line:
+            # Заменяем маркеры на единый стиль
+            line = re.sub(r'^[\s•\-*]+', '▪ ', line)
             cleaned_details.append(line)
-    cleaned_details = '\n'.join(cleaned_details)
 
-    # Поиск изображения товара
-    image_url = search_product_image(article)
-    image_data = None
-    if image_url:
-        try:
-            response = requests.get(image_url)
-            image_data = Image.open(BytesIO(response.content))
-        except Exception as e:
-            print(f"Ошибка загрузки изображения: {e}")
+    # Поиск изображения
+    image_data = search_product_image(article)
 
-    # Создаем словарь для хранения информации о товаре
-    product_info = {
-        'name': f"Артикул: {article}",
+    return {
+        'name': article,
         'details': cleaned_details,
-        'image': image_data,
-        'source': 'Perplexity API + Pexels'
+        'image': image_data
     }
-
-    return product_info
 
 
 def create_product_card(article, product_info):
-    """Создание карточки товара"""
+    """Создание профессиональной карточки товара"""
     try:
-        # Размеры карточки
-        card_width = 800
-        card_height = 1200
-
-        # Создаем белый фон
-        card = Image.new('RGB', (card_width, card_height), 'white')
+        # Размеры и фон
+        card_width, card_height = 800, 1200
+        card = Image.new('RGB', (card_width, card_height), COLORS['background'])
         draw = ImageDraw.Draw(card)
 
         # Загружаем шрифты
-        try:
-            title_font = ImageFont.truetype(FONT_PATH, 40)
-            text_font = ImageFont.truetype(FONT_PATH, 28)
-            small_font = ImageFont.truetype(FONT_PATH, 20)
-        except:
-            # Fallback на стандартные шрифты
-            title_font = ImageFont.load_default(40)
-            text_font = ImageFont.load_default(28)
-            small_font = ImageFont.load_default(20)
+        title_font = load_font('bold', 36)
+        subtitle_font = load_font('bold', 28)
+        text_font = load_font('regular', 22)
+        bullet_font = load_font('bold', 22)
 
-        # Позиции для элементов
-        y_position = 30
+        # Позиционирование
+        y_pos = 40
 
-        # Добавляем изображение товара, если есть
-        if product_info['image']:
-            try:
-                img = product_info['image']
-                # Масштабируем изображение
-                img_width, img_height = img.size
-                new_width = card_width - 40
-                new_height = int((new_width / img_width) * img_height)
-                if new_height > 300:  # Ограничиваем максимальную высоту
-                    new_height = 300
-                    new_width = int((new_height / img_height) * img_width)
+        # Изображение товара (с заглушкой если нет изображения)
+        img = product_info['image'] or Image.open(PLACEHOLDER_IMAGE) if os.path.exists(PLACEHOLDER_IMAGE) else None
 
-                img = img.resize((new_width, new_height), Image.LANCZOS)
+        if img:
+            # Масштабируем с сохранением пропорций
+            img_ratio = img.width / img.height
+            max_width = card_width - 80
+            max_height = 400
 
-                # Центрируем изображение
-                x_position = (card_width - new_width) // 2
-                card.paste(img, (x_position, y_position))
-                y_position += new_height + 30
-            except Exception as e:
-                print(f"Ошибка обработки изображения: {e}")
+            if img_ratio > 1:  # Горизонтальное
+                new_width = min(max_width, img.width)
+                new_height = int(new_width / img_ratio)
+            else:  # Вертикальное
+                new_height = min(max_height, img.height)
+                new_width = int(new_height * img_ratio)
 
-        # Артикул (центрируем)
-        text_width = draw.textlength(product_info['name'], font=title_font)
-        x_position = (card_width - text_width) // 2
-        draw.text((x_position, y_position), product_info['name'], fill='black', font=title_font)
-        y_position += 60
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+
+            # Добавляем белую рамку
+            bordered_img = ImageOps.expand(img, border=1, fill='white')
+            # Добавляем тень
+            shadow = Image.new('RGBA', (new_width + 6, new_height + 6), (0, 0, 0, 30))
+            card.paste(shadow, (37, y_pos + 3), shadow)
+            # Вставляем изображение
+            x_pos = (card_width - new_width) // 2
+            card.paste(bordered_img, (x_pos, y_pos))
+            y_pos += new_height + 40
+
+        # Заголовок артикула
+        draw.text(
+            (40, y_pos),
+            f"АРТИКУЛ: {article}",
+            fill=COLORS['primary'],
+            font=title_font
+        )
+        y_pos += 50
 
         # Разделительная линия
-        draw.line((20, y_position, card_width - 20, y_position), fill='gray', width=2)
-        y_position += 30
+        draw.line([(40, y_pos), (card_width - 40, y_pos)], fill=COLORS['secondary'], width=2)
+        y_pos += 30
 
-        # Характеристики
-        draw.text((30, y_position), "Характеристики:", fill='black', font=text_font)
-        y_position += 50
+        # Заголовок характеристик
+        draw.text(
+            (40, y_pos),
+            "ХАРАКТЕРИСТИКИ",
+            fill=COLORS['primary'],
+            font=subtitle_font
+        )
+        y_pos += 50
 
-        # Отображаем все характеристики
-        for line in product_info['details'].split('\n'):
-            if line.strip():  # Пропускаем пустые строки
-                draw.text((40, y_position), line.strip(), fill='black', font=small_font)
-                y_position += 30
-                if y_position > card_height - 100:
+        # Характеристики с маркерами
+        bullet = "▪"
+        bullet_width = draw.textlength(bullet, font=bullet_font)
+        max_line_width = card_width - 80 - bullet_width
+
+        for line in product_info['details']:
+            if line.strip():
+                # Разбиваем длинные строки
+                words = line.split()
+                current_line = []
+
+                # Первая строка с маркером
+                draw.text((40, y_pos), bullet, fill=COLORS['accent'], font=bullet_font)
+
+                for word in words:
+                    test_line = ' '.join(current_line + [word])
+                    if draw.textlength(test_line, font=text_font) <= max_line_width:
+                        current_line.append(word)
+                    else:
+                        if current_line:
+                            draw.text(
+                                (40 + bullet_width + 10, y_pos),
+                                ' '.join(current_line),
+                                fill=COLORS['text'],
+                                font=text_font
+                            )
+                            y_pos += 35
+                        current_line = [word]
+
+                if current_line:
+                    draw.text(
+                        (40 + bullet_width + 10, y_pos),
+                        ' '.join(current_line),
+                        fill=COLORS['text'],
+                        font=text_font
+                    )
+                    y_pos += 35
+
+                if y_pos > card_height - 50:
                     break
 
-        # Разделительная линия внизу
-        draw.line((20, card_height - 60, card_width - 20, card_height - 60), fill='gray', width=1)
-
-        # Источник
-        source = product_info.get('source', 'Неизвестен')
-        draw.text((30, card_height - 50), f"Источник: {source}", fill='gray', font=small_font)
-
-        # Сохраняем
-        safe_article = sanitize_filename(article)
-        output_path = os.path.join(OUTPUT_FOLDER, f"{safe_article}.jpg")
-        card.save(output_path, quality=90)
+        # Сохранение
+        safe_name = sanitize_filename(article)
+        output_path = os.path.join(OUTPUT_FOLDER, f"{safe_name}.jpg")
+        card.save(output_path, quality=95, optimize=True, dpi=(300, 300))
         print(f"Карточка сохранена: {output_path}")
 
         return True
@@ -214,7 +334,7 @@ def create_product_card(article, product_info):
 
 
 def process_articles(file_path):
-    """Обработка файла с артикулами"""
+    """Обработка всех артикулов"""
     try:
         df = pd.read_excel(file_path)
         articles = df.iloc[:, 1].dropna().astype(str).unique()
@@ -223,13 +343,13 @@ def process_articles(file_path):
 
         for article in articles:
             article = article.strip()
-            print(f"\nОбработка артикула: {article}")
+            print(f"\nОбработка: {article}")
 
-            product_info = extract_product_info_from_perplexity(article)
+            product_info = extract_product_info(article)
             if product_info:
                 create_product_card(article, product_info)
             else:
-                print(f"Информация не найдена для {article}")
+                print(f"Не найдена информация для {article}")
 
             time.sleep(DELAY)
 
@@ -238,6 +358,7 @@ def process_articles(file_path):
 
 
 if __name__ == '__main__':
-    print("Запуск обработки артикулов...")
+    print("=== Генератор профессиональных карточек товаров ===")
+    print("Используются автономные шрифты Noto Sans")
     process_articles(INPUT_FILE)
-    print("Готово!")
+    print("\n=== Обработка завершена ===")
